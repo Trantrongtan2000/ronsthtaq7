@@ -1,207 +1,230 @@
-#include <Arduino.h>
+/****************************************************************************************
+ *  DỰ ÁN: GIÁM SÁT NHIỀU TÍN HIỆU GPIO, GỬI NTFY.SH VÀ LOG LÊN THINGSPEAK
+ *  Phiên bản: 3.3 - Thống nhất logic xử lý trạng thái
+ *
+ *  Chức năng:
+ *  - Sử dụng struct để quản lý cấu hình cho từng kênh một cách chuyên nghiệp.
+ *  - Tái cấu trúc logic trong hàm loop() để xử lý tất cả các kênh một cách đồng nhất,
+ *    loại bỏ lỗi gửi thông báo lặp lại.
+ *  - Giữ nguyên tất cả các chức năng cốt lõi: đa kênh, logic ngược, OTA, ThingSpeak...
+ *
+ ****************************************************************************************/
+
+// Thư viện cần thiết
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
 #include <ESPmDNS.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncOta.h> // Thư viện AsyncOta của Mikael Tulldahl
-#include <HTTPClient.h> // Thư viện này cần thiết cho ntfy.sh
+#include <ElegantOTA.h>
 
-// --- Cấu hình ntfy.sh ---
-const char* NTPY_TOPIC = "ronsthtaq7"; 
-const char* NTPY_SERVER_URL = "https://ntfy.sh/";
+// --- CẤU HÌNH CHÍNH ---
+const char* NTPY_TOPIC = "ronsthtaq7";
+const char* NTPY_SERVER_URL = "https://ntfy.sh";
+const char* hostname = "myEsp32";
 
-// --- Cấu hình Chân GPIO ---
-const int INPUT_PIN = 1; // Chân D1 trên ESP32-C3 thường là GPIO1
+// --- CẤU HÌNH THINGSPEAK ---
+const char* THINGSPEAK_API_KEY = "2NU97VXBB1B9J0DI";
+const unsigned long THINGSPEAK_UPDATE_INTERVAL = 20000UL;
 
-// --- Cấu hình WiFi ---
-const char *hostname = "myEsp32";
-struct WiFiCredentials {
-    const char* ssid;
-    const char* password;
+// --- CẤU HÌNH KÊNH GIÁM SÁT (QUAN TRỌNG NHẤT) ---
+struct ChannelConfig {
+    int pin;                // Chân GPIO
+    bool invertedLogic;     // true: Cảnh báo khi HIGH, false: Cảnh báo khi LOW
+    const char* alertTitle;       // Tiêu đề khi có cảnh báo
+    const char* alertMessage;     // Nội dung khi có cảnh báo
+    const char* alertTags;        // Icon khi có cảnh báo
+    const char* normalTitle;      // Tiêu đề khi trở lại bình thường
+    const char* normalMessage;    // Nội dung khi trở lại bình thường
+    const char* normalTags;       // Icon khi trở lại bình thường
 };
 
-WiFiCredentials wifiList[] = {
-    {"TRONG TAN", "trongtan2000"},
-    {"TAMANH STAFF", "2Bphoquang"},
-    {"TAMANH STAFF", "2bphoquang"}
+const ChannelConfig channels[] = {
+    {1, true, "TRÀN NƯỚC HỆ THỐNG", "Tràn nước!!! Hãy lên kiểm tra ngay.", "error", "Hệ thống khôi phục", "...", "white_check_mark"},
+    {2, false, "Giám sát hệ thống RO NSTH", "Đang chờ bơm nước RO.", "potable_water", "Giám sát hệ thống RO NSTH", "Nước RO đầy", "no_entry_sign"},
+    {3, false, "Giám sát hệ thống RO NSTH", "Hết nước RO!!", "warning", "Giám sát hệ thống RO NSTH", "Đang chờ bơm nước RO.", "potable_water"}
 };
+const int NUM_PINS = sizeof(channels) / sizeof(channels[0]);
+
+// Danh sách WiFi
+struct WiFiCredentials { const char* ssid; const char* password; };
+WiFiCredentials wifiList[] = { {"TAMANH STAFF", "2Bphoqu@ng"}, {"TRONG TAN", "trongtan2000"} };
 const int numWifiNetworks = sizeof(wifiList) / sizeof(wifiList[0]);
 
-// --- Các biến trạng thái ---
-int lastPinState = LOW;
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 50;
-bool notificationSent = false;
+// Cấu hình Analog và Cooldown
+const int ANALOG_THRESHOLD_LOW = 500;
+const int ANALOG_THRESHOLD_HIGH = 1800;
+const unsigned long notificationCooldown = 5000;
 
-// Khởi tạo đối tượng Web Server
-AsyncWebServer server(80);
+// --- CÁC BIẾN TOÀN CỤC ---
+int lastLogicalStates[NUM_PINS]; // 1 = BÌNH THƯỜNG, 0 = CẢNH BÁO
+unsigned long lastNotificationTimes[NUM_PINS];
+unsigned long lastThingSpeakTime = 0;
 
-// Hàm gửi thông báo đến ntfy.sh
-void sendNtfyNotification(String title, String message, String tags = "") {
+WebServer server(80);
+
+// --- CÁC HÀM CHỨC NĂNG ---
+
+/**
+ * @brief Gửi một thông báo đến topic đã cấu hình trên ntfy.sh.
+ */
+void sendNtfyNotification(String title, String message, String tags) {
     if (WiFi.status() == WL_CONNECTED) {
         HTTPClient http;
-        
-        String fullUrl = String(NTPY_SERVER_URL) + String(NTPY_TOPIC);
+        String fullUrl = String(NTPY_SERVER_URL) + "/" + String(NTPY_TOPIC);
         http.begin(fullUrl);
-
         http.addHeader("Title", title);
         http.addHeader("Priority", "default");
-        if (tags != "") {
-            http.addHeader("Tags", tags);
-        } else {
-            http.addHeader("Tags", "bell");
-        }
-
-        Serial.print("Sending to ntfy.sh URL: ");
-        Serial.println(fullUrl);
-        Serial.print("Message: ");
-        Serial.println(message);
-
+        http.addHeader("Tags", tags.isEmpty() ? "bell" : tags);
         int httpResponseCode = http.POST(message);
-
-        if (httpResponseCode > 0) {
-            Serial.print("HTTP Response code: ");
-            Serial.println(httpResponseCode);
-            String response = http.getString();
-            Serial.println("ntfy.sh Response: " + response);
-        } else {
-            Serial.print("Error sending ntfy.sh notification. HTTP error code: ");
-            Serial.println(httpResponseCode);
+        if (httpResponseCode < 0) {
+            Serial.printf("[ntfy] Lỗi khi gửi thông báo: %s\n", http.errorToString(httpResponseCode).c_str());
         }
         http.end();
-    } else {
-        Serial.println("WiFi not connected. Cannot send ntfy.sh notification.");
     }
 }
 
+/**
+ * @brief Gửi trạng thái logic của tất cả các kênh lên ThingSpeak.
+ */
+void sendToThingSpeak(int states[]) {
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        String url = "https://api.thingspeak.com/update?api_key=";
+        url += THINGSPEAK_API_KEY;
+        for (int i = 0; i < NUM_PINS; i++) {
+            url += "&field" + String(i + 1) + "=" + String(states[i]);
+        }
+        http.begin(url);
+        int httpResponseCode = http.GET();
+        if (httpResponseCode < 0) {
+            Serial.printf("[ThingSpeak] Lỗi khi gửi dữ liệu, mã lỗi: %d (%s)\n", httpResponseCode, http.errorToString(httpResponseCode).c_str());
+        }
+        http.end();
+    }
+}
+
+/**
+ * @brief Duyệt qua danh sách wifiList và cố gắng kết nối.
+ */
 void connectToWiFi() {
-    Serial.println("Attempting to connect to WiFi...");
+    Serial.println("Bắt đầu kết nối WiFi...");
     WiFi.mode(WIFI_STA);
-
     for (int i = 0; i < numWifiNetworks; i++) {
-        Serial.printf("Trying to connect to '%s'...\n", wifiList[i].ssid);
+        Serial.printf("Đang thử kết nối vào mạng '%s'...\n", wifiList[i].ssid);
         WiFi.begin(wifiList[i].ssid, wifiList[i].password);
-
         int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
             delay(500);
             Serial.print(".");
             attempts++;
         }
         Serial.println();
-
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("Connected to '%s'!\n", wifiList[i].ssid);
-            Serial.print("IP address: ");
+            Serial.printf("Đã kết nối vào mạng '%s'!\n", wifiList[i].ssid);
+            Serial.print("Địa chỉ IP: ");
             Serial.println(WiFi.localIP());
-
-            // Gửi thông báo khi kết nối mạng thành công
-            String ipMessage = "ESP32-C3 đã kết nối mạng tại " + WiFi.localIP().toString();
-            sendNtfyNotification("ESP32-C3 Online", ipMessage, "wifi");
-
+            sendNtfyNotification("ESP32-C3 Online", "Thiết bị giám sát đa kênh đã online", "desktop_computer");
             return;
         } else {
-            Serial.printf("Failed to connect to '%s'.\n", wifiList[i].ssid);
-            WiFi.disconnect();
+            Serial.printf("Không thể kết nối vào '%s'.\n", wifiList[i].ssid);
+            WiFi.disconnect(true);
+            delay(100);
         }
     }
-
-    Serial.println("Could not connect to any specified WiFi network. Restarting...");
+    Serial.println("Không kết nối được WiFi. Khởi động lại sau 5 giây...");
     delay(5000);
     ESP.restart();
 }
 
-// --- Callback cho sự kiện OTA ---
-// (Các hàm này vẫn tồn tại nhưng sẽ không được gọi tự động bởi thư viện AsyncOta của Mikael Tulldahl)
-void onOTAStart() {
-    Serial.println("OTA Update: Start");
-    // sendNtfyNotification("ESP32-C3 OTA", "Bắt đầu cập nhật firmware qua OTA.", "wrench");
-}
 
-void onOTAEnd() {
-    Serial.println("OTA Update: End");
-    // sendNtfyNotification("ESP32-C3 OTA", "Cập nhật firmware OTA hoàn tất. Thiết bị sẽ khởi động lại.", "tada");
-}
-
-void onOTAProgress(size_t current, size_t total) {
-    Serial.printf("OTA Update: Progress: %u of %u bytes\n", current, total);
-}
-
-void onOTAError(int error) {
-    Serial.printf("OTA Update: Error[%u]: ", error);
-    String errorMessage = "Unknown Error";
-    if (error == 1) errorMessage = "Auth Failed";
-    else if (error == 2) errorMessage = "Begin Failed";
-    else if (error == 3) errorMessage = "Connect Failed";
-    else if (error == 4) errorMessage = "Receive Failed";
-    else if (error == 5) errorMessage = "End Failed";
-    Serial.println(errorMessage);
-    // sendNtfyNotification("ESP32-C3 OTA Error", "Cập nhật firmware OTA thất bại: " + errorMessage, "skull");
-}
-
+// --- CHƯƠNG TRÌNH CHÍNH ---
 void setup() {
     Serial.begin(115200);
-    Serial.println("\nBooting...");
-
-    pinMode(INPUT_PIN, INPUT_PULLUP);
-    lastPinState = digitalRead(INPUT_PIN);
+    Serial.println("\n\n==============================================");
+    Serial.println("   DỰ ÁN GIÁM SÁT - PHIÊN BẢN 3.3 (LOGIC MỚI)");
+    Serial.println("==============================================");
 
     connectToWiFi();
 
-    if (!MDNS.begin(hostname)) {
-        Serial.println("Error setting up mDNS responder!");
-    } else {
-        Serial.printf("mDNS responder started at http://%s.local\n", hostname);
+    for (int i = 0; i < NUM_PINS; i++) {
+        pinMode(channels[i].pin, INPUT);
+        int physicalState = (analogRead(channels[i].pin) < ANALOG_THRESHOLD_LOW) ? 0 : 1; // 0=LOW, 1=HIGH
+        // Chuyển đổi trạng thái vật lý thành trạng thái logic (1=Bình thường, 0=Cảnh báo)
+        lastLogicalStates[i] = (channels[i].invertedLogic) ? !physicalState : physicalState;
+        lastNotificationTimes[i] = 0;
+        Serial.printf("Kênh %d (GPIO %d) - Trạng thái logic ban đầu: %s\n", i + 1, channels[i].pin, (lastLogicalStates[i] == 1 ? "BÌNH THƯỜNG" : "CẢNH BÁO"));
     }
 
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-        String html = "<html><body>";
-        html += "<h1>ESP32-C3 OTA Update & ntfy.sh Alert</h1>";
-        html += "<p>Connected to WiFi. IP: " + WiFi.localIP().toString() + "</p>";
-        html += "<p>Access via mDNS: http://" + String(hostname) + ".local</p>";
-        html += "<p>To update firmware, visit: <a href=\"/ota\">http://" + String(hostname) + ".local/ota</a></p>";
-        html += "<p>GPIO" + String(INPUT_PIN) + " is being monitored for signal changes.</p>";
+    if (!MDNS.begin(hostname)) { Serial.println("Lỗi cài đặt mDNS!"); }
+
+    server.on("/", []() {
+        String html = "<html><head><meta charset='UTF-8'></head><body style='font-family: sans-serif; text-align: center;'>";
+        html += "<h1>ESP32-C3 Giám sát và OTA</h1>";
+        html += "<h2>(Giám sát " + String(NUM_PINS) + " kênh)</h2>";
+        html += "<p><b>Địa chỉ IP:</b> " + WiFi.localIP().toString() + "</p>";
+        html += "<table border='1' style='margin: auto;'><tr><th>Kênh (GPIO)</th><th>Trạng thái</th></tr>";
+        for (int i = 0; i < NUM_PINS; i++) {
+            String statusText = (lastLogicalStates[i] == 0) ? "<b style='color:red;'>" + String(channels[i].alertTitle) + "</b>" : String(channels[i].normalTitle);
+            html += "<tr><td>" + String(channels[i].pin) + "</td><td>" + statusText + "</td></tr>";
+        }
+        html += "</table>";
+        html += "<p style='margin-top: 20px;'><a href='/update' style='padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px;'>Cập nhật Firmware (OTA)</a></p>";
         html += "</body></html>";
-        request->send(200, "text/html", html);
+        server.send(200, "text/html; charset=utf-8", html);
     });
 
-    // --- SỬA ĐỔI QUAN TRỌNG: Loại bỏ các dòng đăng ký callback không tương thích ---
-    // Thư viện AsyncOta của Mikael Tulldahl chỉ cần AsyncOTA.begin(&server);
-    // Nó không hỗ trợ đăng ký callback chi tiết như các thư viện OTA khác.
-    AsyncOTA.begin(&server); // Đây là dòng duy nhất cần thiết cho AsyncOta
-
-    Serial.println("OTA update endpoint available at /ota");
-
+    ElegantOTA.begin(&server);
     server.begin();
-    Serial.println("HTTP server started");
-    Serial.println("Access web interface at http://" + WiFi.localIP().toString() + " or http://" + String(hostname) + ".local");
+    Serial.println("Máy chủ HTTP và OTA đã bắt đầu.");
+    Serial.println("----------------------------------------------");
 }
 
 void loop() {
-    int currentReading = digitalRead(INPUT_PIN);
+    server.handleClient();
+    ElegantOTA.loop();
 
-    if (currentReading != lastPinState) {
-        lastDebounceTime = millis();
-    }
+    // --- Logic giám sát thống nhất cho tất cả các kênh ---
+    for (int i = 0; i < NUM_PINS; i++) {
+        const auto& channel = channels[i];
+        int currentAnalogValue = analogRead(channel.pin);
+        int currentLogicalState = lastLogicalStates[i];
 
-    if ((millis() - lastDebounceTime) > debounceDelay) {
-        if (currentReading != lastPinState) {
-            if (currentReading == LOW) {
-                if (!notificationSent) {
-                    String message = "ESP32-C3: Tín hiệu được phát hiện trên chân D1 (GPIO" + String(INPUT_PIN) + ")!";
-                    String title = "Cảnh báo từ ESP32-C3";
-                    Serial.println(message);
-                    
-                    sendNtfyNotification(title, message, "warning");
-                    notificationSent = true;
+        // Xác định trạng thái vật lý hiện tại
+        int physicalState = -1; // -1 nghĩa là đang ở vùng không xác định
+        if (currentAnalogValue < ANALOG_THRESHOLD_LOW) {
+            physicalState = 0; // LOW
+        } else if (currentAnalogValue > ANALOG_THRESHOLD_HIGH) {
+            physicalState = 1; // HIGH
+        }
+
+        if (physicalState != -1) {
+            // Chuyển đổi trạng thái vật lý thành trạng thái logic (1=Bình thường, 0=Cảnh báo)
+            currentLogicalState = (channel.invertedLogic) ? !physicalState : physicalState;
+
+            // Chỉ hành động KHI CÓ SỰ THAY ĐỔI trạng thái logic
+            if (currentLogicalState != lastLogicalStates[i]) {
+                if (millis() - lastNotificationTimes[i] > notificationCooldown) {
+                    if (currentLogicalState == 0) { // Chuyển sang trạng thái CẢNH BÁO
+                        Serial.printf("Kênh %d (GPIO %d) chuyển sang CẢNH BÁO. Gửi thông báo...\n", i + 1, channel.pin);
+                        sendNtfyNotification(channel.alertTitle, channel.alertMessage, channel.alertTags);
+                    } else { // Chuyển sang trạng thái BÌNH THƯỜNG
+                        Serial.printf("Kênh %d (GPIO %d) trở về BÌNH THƯỜNG. Gửi thông báo...\n", i + 1, channel.pin);
+                        sendNtfyNotification(channel.normalTitle, channel.normalMessage, channel.normalTags);
+                    }
+                    lastNotificationTimes[i] = millis();
                 }
-            } else {
-                notificationSent = false;
-                Serial.println("Tín hiệu trên chân D1 (GPIO" + String(INPUT_PIN) + ") đã trở lại bình thường.");
+                // QUAN TRỌNG: Cập nhật trạng thái logic đã lưu để tránh lặp lại
+                lastLogicalStates[i] = currentLogicalState;
             }
-            lastPinState = currentReading;
         }
     }
-    
-    delay(10);
+
+    // Gửi dữ liệu lên ThingSpeak định kỳ
+    if (millis() - lastThingSpeakTime > THINGSPEAK_UPDATE_INTERVAL) {
+        Serial.println("Đã đến lúc gửi trạng thái các kênh lên ThingSpeak...");
+        sendToThingSpeak(lastLogicalStates);
+        lastThingSpeakTime = millis();
+    }
+
+    delay(20);
 }
